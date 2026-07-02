@@ -1,0 +1,798 @@
+import sys
+import sqlite3
+import csv
+from datetime import datetime, timedelta
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, 
+                             QVBoxLayout, QHBoxLayout, QCalendarWidget, 
+                             QTextEdit, QTableWidget, QTableWidgetItem, 
+                             QPushButton, QLabel, QCheckBox, QDialog, 
+                             QLineEdit, QHeaderView, QComboBox, QColorDialog,
+                             QFileDialog, QInputDialog, QTableView, QMenu)
+from PyQt6.QtCore import Qt, QDate, QRect, QPoint
+from PyQt6.QtGui import QColor, QPainter, QFont, QPen, QBrush, QPolygon, QKeyEvent
+import pyqtgraph as pg
+
+# --- DATABASE ENGINE INIT ---
+def init_db():
+    conn = sqlite3.connect("schedule_budget_tracker.db")
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS daily_descriptions (
+                        date TEXT PRIMARY KEY, description TEXT, color_hex TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS daily_finances (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT,
+                        category TEXT, amount REAL, type TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS budget_caps (
+                        category TEXT PRIMARY KEY, max_amount REAL)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS recurring_rules (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT,
+                        amount REAL, type TEXT, frequency TEXT, start_date TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS savings_goals (
+                        name TEXT PRIMARY KEY, target_amount REAL, current_saved REAL)''')
+    conn.commit()
+    conn.close()
+
+# --- CUSTOM GRAPHICS WIDGETS ---
+class ProgressRingWidget(QWidget):
+    def __init__(self, title="Spent", parent=None):
+        super().__init__(parent)
+        self.setFixedSize(180, 180)
+        self.percentage = 0.0
+        self.title = title
+
+    def set_value(self, numerator, denominator):
+        if denominator > 0:
+            self.percentage = min(numerator / denominator, 1.0)
+        else:
+            self.percentage = 1.0 if numerator > 0 else 0.0
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRect(10, 10, 160, 160)
+        
+        painter.setPen(QPen(QColor("#2D2D2D"), 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawEllipse(rect)
+        
+        accent = QColor("#00ADB5") if self.title == "Saved" else (QColor("#FF4A4A") if self.percentage > 0.85 else QColor("#9B5DE5"))
+        painter.setPen(QPen(accent, 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        
+        start_angle = 90 * 16
+        span_angle = int(-self.percentage * 360 * 16)
+        painter.drawArc(rect, start_angle, span_angle)
+        
+        painter.setPen(QColor("#E0E0E0"))
+        painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"{int(self.percentage * 100)}%\n{self.title}")
+
+class CustomPieChartWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(180, 180)
+        self.slices = {}
+
+    def set_data(self, data_dict):
+        self.slices = data_dict
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRect(10, 10, 160, 160)
+        total = sum(self.slices.values())
+        
+        if total == 0:
+            painter.setBrush(QBrush(QColor("#2D2D2D")))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(rect)
+            painter.setPen(QColor("#888888"))
+            painter.setFont(QFont("Segoe UI", 10))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "No Expense\nData")
+            return
+
+        colors = ["#00ADB5", "#FF4A4A", "#FFB400", "#9B5DE5", "#F15BB5", "#00F5D4"]
+        start_angle = 0
+        for idx, (category, val) in enumerate(self.slices.items()):
+            painter.setBrush(QBrush(QColor(colors[idx % len(colors)])))
+            painter.setPen(Qt.PenStyle.NoPen)
+            span_angle = int((val / total) * 360 * 16)
+            painter.drawPie(rect, start_angle, span_angle)
+            start_angle += span_angle
+
+# --- KEYBOARD INTERACTIVE TABLE EXTENSION ---
+class InteractiveTableWidget(QTableWidget):
+    """Custom Table to handle native keyboard Delete key overrides."""
+    def __init__(self, rows, cols, parent=None):
+        super().__init__(rows, cols, parent)
+        self.delete_callback = None
+
+    def set_delete_callback(self, callback):
+        self.delete_callback = callback
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key.Key_Delete:
+            row = self.currentRow()
+            if row >= 0 and self.delete_callback:
+                self.delete_callback(row)
+        else:
+            super().keyPressEvent(event)
+
+# --- CUSTOM CALENDAR OVERLAYS ---
+class AdvancedCustomCalendar(QCalendarWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.show_amounts = False
+        self.highlighted_dates = set()
+        self.apply_custom_week_header_label()
+
+    def apply_custom_week_header_label(self):
+        view = self.findChild(QTableView)
+        if view:
+            model = view.model()
+            if model: model.setHeaderData(0, Qt.Orientation.Horizontal, "Week")
+
+    def set_amounts_visible(self, visible): self.show_amounts = visible
+    def set_search_highlights(self, dates_set): self.highlighted_dates = dates_set
+
+    def paintCell(self, painter, rect, date):
+        date_str = date.toString("MM/dd/yyyy")
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT color_hex FROM daily_descriptions WHERE date = ?", (date_str,))
+        color_row = cursor.fetchone()
+        cursor.execute("SELECT 1 FROM daily_finances WHERE date = ? AND type = 'income' LIMIT 1", (date_str,))
+        has_income = cursor.fetchone() is not None
+        cursor.execute("SELECT 1 FROM daily_finances WHERE date = ? AND type = 'expense' LIMIT 1", (date_str,))
+        has_expense = cursor.fetchone() is not None
+        conn.close()
+        
+        has_activity = color_row is not None and color_row[0] is not None and color_row[0] != ""
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QBrush(QColor("#121212")))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRect(rect)
+
+        if date_str in self.highlighted_dates:
+            painter.setPen(QPen(QColor("#FFB400"), 2))
+            painter.drawRect(rect.adjusted(1, 1, -1, -1))
+
+        if has_activity:
+            painter.setBrush(QBrush(QColor(color_row[0])))
+            painter.setPen(Qt.PenStyle.NoPen)
+            triangle = QPolygon([QPoint(rect.right() - 12, rect.top()), QPoint(rect.right(), rect.top()), QPoint(rect.right(), rect.top() + 12)])
+            painter.drawPolygon(triangle)
+
+        painter.setPen(QColor("#E0E0E0") if date.month() == self.monthShown() else QColor("#555555"))
+        painter.setFont(QFont("Segoe UI", 10))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(date.day()))
+        painter.restore()
+        
+        if self.show_amounts:
+            painter.save()
+            painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            if has_income and has_expense:
+                painter.setPen(QColor("#00FF66"))
+                painter.drawText(QRect(rect.left(), rect.bottom() - 18, rect.width() - 12, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "$")
+                painter.setPen(QColor("#FF4A4A"))
+                painter.drawText(QRect(rect.left(), rect.bottom() - 18, rect.width() - 3, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "$")
+            elif has_income:
+                painter.setPen(QColor("#00FF66"))
+                painter.drawText(QRect(rect.left(), rect.bottom() - 18, rect.width() - 3, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "$")
+            elif has_expense:
+                painter.setPen(QColor("#FF4A4A"))
+                painter.drawText(QRect(rect.left(), rect.bottom() - 18, rect.width() - 3, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "$")
+            painter.restore()
+
+# --- DAY ENTRY DETAILS POP-UP ---
+class DayDetailDialog(QDialog):
+    def __init__(self, date_str, parent=None):
+        super().__init__(parent)
+        self.date_str = date_str
+        self.selected_color_hex = ""
+        self.setWindowTitle(f"Details for {self.date_str}")
+        self.resize(750, 450)
+        
+        main_layout = QVBoxLayout(self)
+        split_layout = QHBoxLayout()
+        
+        left_box = QVBoxLayout()
+        left_box.addWidget(QLabel("<b>Daily Financial Ledger</b> <small>(Right-click or press Del to remove row)</small>"))
+        
+        self.finance_table = InteractiveTableWidget(0, 3)
+        self.finance_table.setHorizontalHeaderLabels(["Category", "Amount", "Type"])
+        self.finance_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.finance_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.finance_table.customContextMenuRequested.connect(self.provide_table_context_menu)
+        self.finance_table.set_delete_callback(lambda r: self.finance_table.removeRow(r))
+        left_box.addWidget(self.finance_table)
+        
+        input_form = QHBoxLayout()
+        self.cat_input = QLineEdit(); self.cat_input.setPlaceholderText("Category")
+        self.amt_input = QLineEdit(); self.amt_input.setPlaceholderText("Amount")
+        self.type_input = QComboBox(); self.type_input.addItems(["expense", "income"])
+        
+        # KEYBOARD FIX: Allow pressing Enter inside forms to submit immediately
+        self.cat_input.returnPressed.connect(self.add_transaction)
+        self.amt_input.returnPressed.connect(self.add_transaction)
+        
+        input_form.addWidget(self.cat_input); input_form.addWidget(self.amt_input); input_form.addWidget(self.type_input)
+        left_box.addLayout(input_form)
+        
+        self.add_btn = QPushButton("Add Record")
+        self.add_btn.clicked.connect(self.add_transaction)
+        left_box.addWidget(self.add_btn)
+        split_layout.addLayout(left_box, stretch=4)
+        
+        right_box = QVBoxLayout()
+        right_box.addWidget(QLabel("<b>Day Activity Description</b>"))
+        self.day_description = QTextEdit()
+        right_box.addWidget(self.day_description)
+        
+        color_layout = QHBoxLayout()
+        self.color_preview = QLabel("   ")
+        self.color_preview.setFixedSize(30, 20)
+        self.color_preview.setStyleSheet("border: 1px solid #555;")
+        self.pick_color_btn = QPushButton("Select Color")
+        self.pick_color_btn.clicked.connect(self.open_color_picker)
+        color_layout.addWidget(QLabel("Corner Tag Color:"))
+        color_layout.addWidget(self.color_preview)
+        color_layout.addWidget(self.pick_color_btn)
+        right_box.addLayout(color_layout)
+        
+        split_layout.addLayout(right_box, stretch=4)
+        main_layout.addLayout(split_layout)
+        
+        action_buttons = QHBoxLayout()
+        self.save_btn = QPushButton("Save Data Changes")
+        self.save_btn.clicked.connect(self.save_all_data)
+        action_buttons.addStretch(); action_buttons.addWidget(self.save_btn)
+        main_layout.addLayout(action_buttons)
+        self.load_existing_data()
+
+    def provide_table_context_menu(self, pos):
+        row = self.finance_table.currentRow()
+        if row >= 0:
+            menu = QMenu(self)
+            delete_action = menu.addAction("❌ Delete Entry Selection")
+            if menu.exec(self.finance_table.viewport().mapToGlobal(pos)) == delete_action:
+                self.finance_table.removeRow(row)
+
+    def open_color_picker(self):
+        initial = QColor(self.selected_color_hex) if self.selected_color_hex else QColor("#121212")
+        color = QColorDialog.getColor(initial, self, "Pick Day Identifier Color")
+        if color.isValid():
+            self.selected_color_hex = color.name()
+            self.color_preview.setStyleSheet(f"background-color: {self.selected_color_hex}; border: 1px solid #fff;")
+
+    def add_transaction(self):
+        category = self.cat_input.text().strip().lower()
+        amount_txt = self.amt_input.text().strip()
+        trans_type = self.type_input.currentText()
+        if category and amount_txt:
+            try:
+                amount = float(amount_txt)
+                row_idx = self.finance_table.rowCount()
+                self.finance_table.insertRow(row_idx)
+                self.finance_table.setItem(row_idx, 0, QTableWidgetItem(category))
+                self.finance_table.setItem(row_idx, 1, QTableWidgetItem(f"{amount:.2f}"))
+                self.finance_table.setItem(row_idx, 2, QTableWidgetItem(trans_type))
+                self.cat_input.clear(); self.amt_input.clear()
+            except ValueError: pass
+
+    def load_existing_data(self):
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT description, color_hex FROM daily_descriptions WHERE date = ?", (self.date_str,))
+        desc_row = cursor.fetchone()
+        if desc_row:
+            self.day_description.setText(desc_row[0] if desc_row[0] else "")
+            if desc_row[1]:
+                self.selected_color_hex = desc_row[1]
+                self.color_preview.setStyleSheet(f"background-color: {self.selected_color_hex}; border: 1px solid #fff;")
+        cursor.execute("SELECT category, amount, type FROM daily_finances WHERE date = ?", (self.date_str,))
+        for row_idx, row in enumerate(cursor.fetchall()):
+            self.finance_table.insertRow(row_idx)
+            self.finance_table.setItem(row_idx, 0, QTableWidgetItem(str(row[0])))
+            self.finance_table.setItem(row_idx, 1, QTableWidgetItem(f"{row[1]:.2f}"))
+            self.finance_table.setItem(row_idx, 2, QTableWidgetItem(str(row[2])))
+        conn.close()
+
+    def save_all_data(self):
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        desc_text = self.day_description.toPlainText().strip()
+        if desc_text or self.selected_color_hex:
+            cursor.execute("INSERT OR REPLACE INTO daily_descriptions (date, description, color_hex) VALUES (?, ?, ?)", (self.date_str, desc_text, self.selected_color_hex))
+        else:
+            cursor.execute("DELETE FROM daily_descriptions WHERE date = ?", (self.date_str,))
+        cursor.execute("DELETE FROM daily_finances WHERE date = ?", (self.date_str,))
+        for row in range(self.finance_table.rowCount()):
+            cat = self.finance_table.item(row, 0).text()
+            amt = float(self.finance_table.item(row, 1).text())
+            ttype = self.finance_table.item(row, 2).text()
+            cursor.execute("INSERT INTO daily_finances (date, category, amount, type) VALUES (?, ?, ?, ?)", (self.date_str, cat, amt, ttype))
+        conn.commit()
+        conn.close()
+        self.accept()
+
+# --- CSS STYLESHEET SCHEMA ---
+DARK_STYLE = """
+    QMainWindow, QWidget, QDialog, QMenu { background-color: #121212; color: #E0E0E0; font-family: 'Segoe UI', Arial, sans-serif; }
+    QTabWidget::pane { border: 1px solid #2C2C2C; }
+    QTabBar::tab { background: #1E1E1E; padding: 10px 20px; margin-right: 2px; }
+    QTabBar::tab:selected { background: #2D2D2D; border-bottom: 2px solid #00ADB5; }
+    QCalendarWidget QTableView { gridline-color: #FFFFFF; background-color: #121212; }
+    QCalendarWidget QWidget { background-color: #1E1E1E; color: #E0E0E0; }
+    QCalendarWidget QAbstractItemView:enabled { color: #E0E0E0; background-color: #121212; selection-background-color: #333333; selection-color: #00ADB5; }
+    QTextEdit, QTableWidget, QLineEdit, QComboBox { background-color: #1E1E1E; border: 1px solid #333333; color: #E0E0E0; border-radius: 4px; padding: 4px; }
+    QMenu::item:selected { background-color: #00ADB5; color: #121212; }
+    QPushButton { background-color: #00ADB5; color: #EEEEEE; border: none; padding: 8px 15px; border-radius: 4px; font-weight: bold; }
+    QPushButton:hover { background-color: #008C9E; }
+    QHeaderView::section { background-color: #2D2D2D; color: #E0E0E0; border: 1px solid #333333; }
+"""
+
+# --- MAIN RUNTIME APPLICATION ---
+class TrackerApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Apex Schedule & Financial Suite Pro")
+        self.resize(1200, 800)
+        init_db()
+        self.process_recurring_rules()
+        
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+        
+        self.init_calendar_tab()
+        self.init_budget_tab()
+        self.init_automation_goals_tab()
+        self.init_advanced_analytics_tab() # Added Tab 1 Interface Feature
+        
+        self.tabs.currentChanged.connect(self.handle_tab_change)
+        self.setStyleSheet(DARK_STYLE)
+        
+    def init_calendar_tab(self):
+        calendar_widget = QWidget()
+        layout = QVBoxLayout(calendar_widget)
+        top_bar = QHBoxLayout()
+        self.toggle_cb = QCheckBox("Toggle Finances ($) View")
+        self.toggle_cb.stateChanged.connect(self.update_calendar_view_toggles)
+        top_bar.addWidget(self.toggle_cb)
+        top_bar.addStretch()
+        
+        self.search_input = QLineEdit(); self.search_input.setPlaceholderText("Search schedules..."); self.search_input.setFixedWidth(250)
+        self.search_input.textChanged.connect(self.execute_search)
+        top_bar.addWidget(QLabel("Search engine:")); top_bar.addWidget(self.search_input)
+        layout.addLayout(top_bar)
+        
+        self.calendar = AdvancedCustomCalendar()
+        self.calendar.setGridVisible(True)
+        self.calendar.clicked.connect(self.open_day_dialog)
+        layout.addWidget(self.calendar)
+        self.tabs.addTab(calendar_widget, "Calendar View")
+        
+    def init_budget_tab(self):
+        budget_widget = QWidget()
+        master_layout = QHBoxLayout(budget_widget)
+        left_panel = QVBoxLayout()
+        self.title_lbl = QLabel("<h2>Monthly Overview</h2>")
+        self.income_lbl = QLabel("Total Income: $0.00")
+        self.expense_lbl = QLabel("Total Expenses: $0.00")
+        self.net_lbl = QLabel("Net Balance: $0.00")
+        
+        left_panel.addWidget(self.title_lbl); left_panel.addWidget(self.income_lbl); left_panel.addWidget(self.expense_lbl); left_panel.addWidget(self.net_lbl)
+        left_panel.addSpacing(10)
+        
+        caps_btn_layout = QHBoxLayout()
+        self.set_cap_btn = QPushButton("Set Spending Target"); self.set_cap_btn.clicked.connect(self.configure_category_cap)
+        self.export_btn = QPushButton("📁 Export CSV"); self.export_btn.clicked.connect(self.export_to_csv)
+        caps_btn_layout.addWidget(self.set_cap_btn); caps_btn_layout.addWidget(self.export_btn)
+        left_panel.addLayout(caps_btn_layout)
+        
+        left_panel.addWidget(QLabel("<b>Category Spending Targets (Click row to drill-down):</b>"))
+        
+        # UPGRADED: Table allows Del key row removals
+        self.caps_table = InteractiveTableWidget(0, 3)
+        self.caps_table.setHorizontalHeaderLabels(["Category", "Spent Current", "Ceiling Target Limit"])
+        self.caps_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.caps_table.itemClicked.connect(self.drill_down_category_items)
+        self.caps_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.caps_table.customContextMenuRequested.connect(lambda p: self.provide_generic_context(p, self.caps_table, self.delete_budget_cap_record))
+        self.caps_table.set_delete_callback(self.delete_budget_cap_record)
+        left_panel.addWidget(self.caps_table)
+        
+        left_panel.addWidget(QLabel("<b>Category Breakdown Itemized Transactions:</b>"))
+        self.drill_down_table = QTableWidget(0, 2)
+        self.drill_down_table.setHorizontalHeaderLabels(["Date", "Amount"])
+        self.drill_down_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        left_panel.addWidget(self.drill_down_table)
+        
+        master_layout.addLayout(left_panel, stretch=5)
+        
+        right_panel = QVBoxLayout()
+        right_panel.addWidget(QLabel("<center><b>Budget Progress Ring</b></center>"))
+        self.progress_ring = ProgressRingWidget("Spent")
+        right_panel.addWidget(self.progress_ring, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        right_panel.addWidget(QLabel("<center><b>Active Savings Goals Milestones Ring</b></center>"))
+        self.savings_ring = ProgressRingWidget("Saved")
+        right_panel.addWidget(self.savings_ring, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        right_panel.addWidget(QLabel("<center><b>Expense Breakdown Split Chart</b></center>"))
+        self.pie_chart = CustomPieChartWidget()
+        right_panel.addWidget(self.pie_chart, alignment=Qt.AlignmentFlag.AlignCenter)
+        master_layout.addLayout(right_panel, stretch=4)
+        self.tabs.addTab(budget_widget, "Metrics Visualization")
+
+    def init_automation_goals_tab(self):
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        
+        left = QVBoxLayout()
+        left.addWidget(QLabel("<h2>1. Recurring Automated Rules Engine</h2>"))
+        
+        # UPGRADED: Table allows Del key row removals
+        self.recur_table = InteractiveTableWidget(0, 4)
+        self.recur_table.setHorizontalHeaderLabels(["Category", "Amount", "Type", "Frequency"])
+        self.recur_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.recur_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.recur_table.customContextMenuRequested.connect(lambda p: self.provide_generic_context(p, self.recur_table, self.delete_recurring_rule_record))
+        self.recur_table.set_delete_callback(self.delete_recurring_rule_record)
+        left.addWidget(self.recur_table)
+        
+        f_layout = QHBoxLayout()
+        self.r_cat = QLineEdit(); self.r_cat.setPlaceholderText("Category")
+        self.r_amt = QLineEdit(); self.r_amt.setPlaceholderText("Amount")
+        self.r_type = QComboBox(); self.r_type.addItems(["expense", "income"])
+        self.r_freq = QComboBox(); self.r_freq.addItems(["Daily", "Weekly", "Monthly", "Yearly"])
+        
+        # KEYBOARD FIX: Allow pressing Enter inside forms to submit immediately
+        self.r_cat.returnPressed.connect(self.save_recurring_rule)
+        self.r_amt.returnPressed.connect(self.save_recurring_rule)
+        
+        f_layout.addWidget(self.r_cat); f_layout.addWidget(self.r_amt); f_layout.addWidget(self.r_type); f_layout.addWidget(self.r_freq)
+        left.addLayout(f_layout)
+        
+        self.add_recur_btn = QPushButton("Save Recurring Rule Setup"); self.add_recur_btn.clicked.connect(self.save_recurring_rule)
+        left.addWidget(self.add_recur_btn)
+        layout.addLayout(left, stretch=5)
+        
+        right = QVBoxLayout()
+        right.addWidget(QLabel("<h2>2. Long-Term Savings Goals</h2>"))
+        
+        # UPGRADED: Table allows Del key row removals
+        self.goals_table = InteractiveTableWidget(0, 3)
+        self.goals_table.setHorizontalHeaderLabels(["Goal Name", "Current Saved", "Target Value"])
+        self.goals_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.goals_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.goals_table.customContextMenuRequested.connect(lambda p: self.provide_generic_context(p, self.goals_table, self.delete_savings_goal_record))
+        self.goals_table.set_delete_callback(self.delete_savings_goal_record)
+        right.addWidget(self.goals_table)
+        
+        g_layout = QHBoxLayout()
+        self.g_name = QLineEdit(); self.g_name.setPlaceholderText("Goal Name e.g. Tuition")
+        self.g_target = QLineEdit(); self.g_target.setPlaceholderText("Target Amount")
+        self.g_deposit = QLineEdit(); self.g_deposit.setPlaceholderText("Add Savings Deposit ($)")
+        
+        # KEYBOARD FIX: Allow pressing Enter inside forms to submit immediately
+        self.g_name.returnPressed.connect(self.save_savings_goal)
+        self.g_target.returnPressed.connect(self.save_savings_goal)
+        self.g_deposit.returnPressed.connect(self.save_savings_goal)
+        
+        g_layout.addWidget(self.g_name); g_layout.addWidget(self.g_target); g_layout.addWidget(self.g_deposit)
+        right.addLayout(g_layout)
+        
+        self.save_goal_btn = QPushButton("Update / Log Savings Goal"); self.save_goal_btn.clicked.connect(self.save_savings_goal)
+        right.addWidget(self.save_goal_btn)
+        layout.addLayout(right, stretch=5)
+        
+        self.tabs.addTab(tab, "Automation & Goals Control")
+
+    def init_advanced_analytics_tab(self):
+        """Feature 1 Module Layout: Time-series plots & historical category distribution graphs."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        layout.addWidget(QLabel("<h2>Interactive Financial Trends Analytics Dashboard</h2>"))
+        
+        # Interactive Time Series Plot Engine Configuration
+        self.trend_plot = pg.PlotWidget()
+        self.trend_plot.setBackground("#1E1E1E")
+        self.trend_plot.setTitle("Net Savings History Curve Over Time", color="#E0E0E0", size="12pt")
+        self.trend_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.trend_plot.setLabel('left', 'Balance ($)', color="#E0E0E0")
+        self.trend_plot.setLabel('bottom', 'Transactions Log Timeline Index', color="#E0E0E0")
+        layout.addWidget(self.trend_plot, stretch=1)
+        
+        # Category Comparison Bar Graph Configuration
+        self.bar_plot = pg.PlotWidget()
+        self.bar_plot.setBackground("#1E1E1E")
+        self.bar_plot.setTitle("Monthly Category Realized Expense Expenditures Comparison Bar Graph", color="#E0E0E0", size="12pt")
+        self.bar_plot.showGrid(y=True, alpha=0.3)
+        self.bar_plot.setLabel('left', 'Spent Currency Value ($)', color="#E0E0E0")
+        layout.addWidget(self.bar_plot, stretch=1)
+        
+        self.tabs.addTab(tab, "Interactive Historical Trends")
+
+    # --- GENERIC REUSABLE DELETION MOUSE UX ACTIONS ---
+    def provide_generic_context(self, pos, table, deletion_handler):
+        row = table.currentRow()
+        if row >= 0:
+            menu = QMenu(self)
+            delete_action = menu.addAction("❌ Permanent Row Record Deletion")
+            if menu.exec(table.viewport().mapToGlobal(pos)) == delete_action:
+                deletion_handler(row)
+
+    # --- SYSTEM EXPLICIT DELETION CONSOLE PIPELINES ---
+    def delete_budget_cap_record(self, row):
+        category = self.caps_table.item(row, 0).text()
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM budget_caps WHERE category = ?", (category,))
+        conn.commit(); conn.close()
+        self.refresh_budget_metrics()
+
+    def delete_recurring_rule_record(self, row):
+        category = self.recur_table.item(row, 0).text()
+        amount = float(self.recur_table.item(row, 1).text())
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM recurring_rules WHERE category = ? AND amount = ?", (category, amount))
+        conn.commit(); conn.close()
+        self.refresh_automation_tab_metrics()
+        self.process_recurring_rules()
+
+    def delete_savings_goal_record(self, row):
+        name = self.goals_table.item(row, 0).text()
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM savings_goals WHERE name = ?", (name,))
+        conn.commit(); conn.close()
+        self.refresh_automation_tab_metrics()
+
+    # --- ADVANCED LOGIC PIPELINES AUTOMATION INTERFACES ---
+    def process_recurring_rules(self):
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, category, amount, type, frequency, start_date FROM recurring_rules")
+        rules = cursor.fetchall()
+        today = datetime.now().date()
+        
+        for r_id, cat, amt, ttype, freq, s_date_str in rules:
+            start_date = datetime.strptime(s_date_str, "%Y-%m-%d").date()
+            current_eval = start_date
+            
+            while current_eval <= today:
+                date_formatted = current_eval.strftime("%m/%d/%Y")
+                cursor.execute("SELECT 1 FROM daily_finances WHERE date = ? AND category = ? AND amount = ? AND type = ?", 
+                               (date_formatted, cat, amt, ttype))
+                if not cursor.fetchone():
+                    cursor.execute("INSERT INTO daily_finances (date, category, amount, type) VALUES (?, ?, ?, ?)", 
+                                   (date_formatted, cat, amt, ttype))
+                
+                if freq == "Daily": current_eval += timedelta(days=1)
+                elif freq == "Weekly": current_eval += timedelta(weeks=1)
+                elif freq == "Monthly":
+                    days = 31 if current_eval.month in [1,3,5,7,8,10,12] else (30 if current_eval.month != 2 else (29 if current_eval.year % 4 == 0 else 28))
+                    current_eval += timedelta(days=days)
+                elif freq == "Yearly":
+                    try: current_eval = current_eval.replace(year=current_eval.year + 1)
+                    except ValueError: current_eval += timedelta(days=365)
+        conn.commit()
+        conn.close()
+
+    def save_recurring_rule(self):
+        cat = self.r_cat.text().strip().lower()
+        try:
+            amt = float(self.r_amt.text().strip())
+            ttype = self.r_type.currentText()
+            freq = self.r_freq.currentText()
+            if cat:
+                conn = sqlite3.connect("schedule_budget_tracker.db")
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO recurring_rules (category, amount, type, frequency, start_date) VALUES (?, ?, ?, ?, ?)",
+                               (cat, amt, ttype, freq, datetime.now().strftime("%Y-%m-%d")))
+                conn.commit(); conn.close()
+                self.r_cat.clear(); self.r_amt.clear()
+                self.refresh_automation_tab_metrics()
+                self.process_recurring_rules()
+        except ValueError: pass
+
+    def save_savings_goal(self):
+        name = self.g_name.text().strip()
+        try:
+            target = float(self.g_target.text().strip()) if self.g_target.text().strip() else None
+            deposit = float(self.g_deposit.text().strip()) if self.g_deposit.text().strip() else 0.0
+            if name:
+                conn = sqlite3.connect("schedule_budget_tracker.db")
+                cursor = conn.cursor()
+                cursor.execute("SELECT target_amount, current_saved FROM savings_goals WHERE name = ?", (name,))
+                row = cursor.fetchone()
+                if row:
+                    final_target = target if target is not None else row[0]
+                    final_saved = row[1] + deposit
+                else:
+                    final_target = target if target is not None else 0.0
+                    final_saved = deposit
+                cursor.execute("INSERT OR REPLACE INTO savings_goals (name, target_amount, current_saved) VALUES (?, ?, ?)",
+                               (name, final_target, final_saved))
+                conn.commit(); conn.close()
+                self.g_name.clear(); self.g_target.clear(); self.g_deposit.clear()
+                self.refresh_automation_tab_metrics()
+        except ValueError: pass
+
+    def refresh_automation_tab_metrics(self):
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT category, amount, type, frequency FROM recurring_rules")
+        self.recur_table.setRowCount(0)
+        for idx, row in enumerate(cursor.fetchall()):
+            self.recur_table.insertRow(idx)
+            for c in range(4): self.recur_table.setItem(idx, c, QTableWidgetItem(str(row[c])))
+            
+        cursor.execute("SELECT name, current_saved, target_amount FROM savings_goals")
+        self.goals_table.setRowCount(0)
+        for idx, row in enumerate(cursor.fetchall()):
+            self.goals_table.insertRow(idx)
+            self.goals_table.setItem(idx, 0, QTableWidgetItem(str(row[0])))
+            self.goals_table.setItem(idx, 1, QTableWidgetItem(f"${row[1]:,.2f}"))
+            self.goals_table.setItem(idx, 2, QTableWidgetItem(f"${row[2]:,.2f}"))
+        conn.close()
+
+    def drill_down_category_items(self, item):
+        row = item.row()
+        category_name = self.caps_table.item(row, 0).text()
+        current_date = self.calendar.selectedDate()
+        search_pattern = f"{current_date.toString('MM')}/%/{current_date.toString('yyyy')}"
+        
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT date, amount FROM daily_finances WHERE date LIKE ? AND category = ? AND type = 'expense' ORDER BY date DESC", (search_pattern, category_name))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        self.drill_down_table.setRowCount(0)
+        for idx, data in enumerate(rows):
+            self.drill_down_table.insertRow(idx)
+            self.drill_down_table.setItem(idx, 0, QTableWidgetItem(str(data[0])))
+            self.drill_down_table.setItem(idx, 1, QTableWidgetItem(f"${data[1]:,.2f}"))
+
+    def refresh_advanced_analytics_plots(self):
+        """Feature 1 Execution Engine: Runs vector calculations to plot real-time trend charts."""
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT amount, type FROM daily_finances ORDER BY id ASC")
+        rows = cursor.fetchall()
+        
+        # 1. Compute Running Historical Net Savings History curve
+        running_net = 0.0
+        y_data = []
+        for amt, ttype in rows:
+            if ttype == 'income': running_net += amt
+            else: running_net -= amt
+            y_data.append(running_net)
+            
+        self.trend_plot.clear()
+        if y_data:
+            self.trend_plot.plot(y_data, pen=pg.mkPen(color="#00ADB5", width=3), symbol='o', symbolSize=6, symbolBrush="#9B5DE5")
+            
+        # 2. Compute Bar Chart Matrix for Current Selected Month
+        current_date = self.calendar.selectedDate()
+        search_pattern = f"{current_date.toString('MM')}/%/{current_date.toString('yyyy')}"
+        cursor.execute("SELECT category, SUM(amount) FROM daily_finances WHERE date LIKE ? AND type = 'expense' GROUP BY category", (search_pattern,))
+        bar_rows = cursor.fetchall()
+        conn.close()
+        
+        self.bar_plot.clear()
+        if bar_rows:
+            x_indices = list(range(len(bar_rows)))
+            heights = [row[1] for row in bar_rows]
+            labels = [row[0] for row in bar_rows]
+            
+            bar_item = pg.BarGraphItem(x=x_indices, height=heights, width=0.5, brush="#FF4A4A", pen="#121212")
+            self.bar_plot.addItem(bar_item)
+            
+            # Label categorical strings along horizontal x-axis bounds manually
+            ax = self.bar_plot.getAxis('bottom')
+            ax.setTicks([[(i, labels[i]) for i in x_indices]])
+
+    # --- STANDARD APPARATUS MANAGEMENT ---
+    def handle_tab_change(self, index):
+        if index == 1: self.refresh_budget_metrics()
+        elif index == 2: self.refresh_automation_tab_metrics()
+        elif index == 3: self.refresh_advanced_analytics_plots()
+
+    def execute_search(self, text):
+        query = text.strip()
+        if not query:
+            self.calendar.set_search_highlights(set()); self.calendar.updateCells(); return
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT date FROM daily_descriptions WHERE description LIKE ?", (f"%{query}%",))
+        self.calendar.set_search_highlights({row[0] for row in cursor.fetchall()})
+        conn.close()
+        self.calendar.updateCells()
+
+    def configure_category_cap(self):
+        category, ok1 = QInputDialog.getText(self, "Category Target Set", "Enter Category Name:")
+        if ok1 and category:
+            category = category.strip().lower()
+            limit, ok2 = QInputDialog.getDouble(self, "Target Cap Limit", f"Enter maximum cap for '{category}':", 0.0, 0.0, 100000.0, 2)
+            if ok2:
+                conn = sqlite3.connect("schedule_budget_tracker.db")
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR REPLACE INTO budget_caps (category, max_amount) VALUES (?, ?)", (category, limit))
+                conn.commit(); conn.close()
+                self.refresh_budget_metrics()
+
+    def export_to_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Data", "", "CSV Files (*.csv)")
+        if path:
+            conn = sqlite3.connect("schedule_budget_tracker.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT date, category, amount, type FROM daily_finances ORDER BY date DESC")
+            rows = cursor.fetchall(); conn.close()
+            with open(path, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Date", "Category", "Amount", "Type"])
+                writer.writerows(rows)
+
+    def refresh_budget_metrics(self):
+        current_date = self.calendar.selectedDate()
+        month_str = current_date.toString("MM")
+        year_str = current_date.toString("yyyy")
+        search_pattern = f"{month_str}/%/{year_str}"
+        
+        conn = sqlite3.connect("schedule_budget_tracker.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT SUM(amount) FROM daily_finances WHERE date LIKE ? AND type = 'income'", (search_pattern,))
+        income = cursor.fetchone()[0] or 0.0
+        cursor.execute("SELECT SUM(amount) FROM daily_finances WHERE date LIKE ? AND type = 'expense'", (search_pattern,))
+        expenses = cursor.fetchone()[0] or 0.0
+        cursor.execute("SELECT category, SUM(amount) FROM daily_finances WHERE date LIKE ? AND type = 'expense' GROUP BY category", (search_pattern,))
+        category_splits = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        cursor.execute("SELECT category, max_amount FROM budget_caps")
+        configured_caps = cursor.fetchall()
+        self.caps_table.setRowCount(0)
+        for row_idx, (cat, cap_limit) in enumerate(configured_caps):
+            cursor.execute("SELECT SUM(amount) FROM daily_finances WHERE date LIKE ? AND type = 'expense' AND category = ?", (search_pattern, cat))
+            current_spent = cursor.fetchone()[0] or 0.0
+            self.caps_table.insertRow(row_idx)
+            self.caps_table.setItem(row_idx, 0, QTableWidgetItem(cat))
+            self.caps_table.setItem(row_idx, 1, QTableWidgetItem(f"${current_spent:,.2f}"))
+            self.caps_table.setItem(row_idx, 2, QTableWidgetItem(f"${cap_limit:,.2f}"))
+            if current_spent > cap_limit: self.caps_table.item(row_idx, 1).setForeground(QColor("#FF4A4A"))
+            
+        cursor.execute("SELECT SUM(current_saved), SUM(target_amount) FROM savings_goals")
+        savings_row = cursor.fetchone()
+        total_saved = savings_row[0] or 0.0
+        total_savings_target = savings_row[1] or 0.0
+        conn.close()
+        
+        self.title_lbl.setText(f"<h2>Overview for {current_date.toString('MMMM yyyy')}</h2>")
+        self.income_lbl.setText(f"Total Monthly Income: <span style='color:#00FF66;'>${income:,.2f}</span>")
+        self.expense_lbl.setText(f"Total Monthly Expenses: <span style='color:#FF4A4A;'>${expenses:,.2f}</span>")
+        net = income - expenses
+        self.net_lbl.setText(f"Net Balance: <span style='color:{'#00FF66;' if net >= 0 else '#FF4A4A;'}'>${net:,.2f}</span>")
+        
+        self.progress_ring.set_value(expenses, income)
+        self.savings_ring.set_value(total_saved, total_savings_target)
+        self.pie_chart.set_data(category_splits)
+        self.drill_down_table.setRowCount(0)
+
+    def open_day_dialog(self, qdate):
+        date_str = qdate.toString("MM/dd/yyyy")
+        dialog = DayDetailDialog(date_str, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted: self.calendar.updateCells()
+
+    def update_calendar_view_toggles(self, state):
+        self.calendar.set_amounts_visible(state == 2); self.calendar.updateCells()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = TrackerApp()
+    window.show()
+    sys.exit(app.exec())
