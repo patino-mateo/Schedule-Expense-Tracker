@@ -337,7 +337,7 @@ DARK_STYLE = """
 class TrackerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Apex Schedule & Financial Suite Pro")
+        self.setWindowTitle("Financial Schedule") #<------ Name it what ever you want to name it, this is the title schedule name.
         self.resize(1200, 800)
         init_db()
         self.process_recurring_rules()
